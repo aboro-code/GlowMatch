@@ -23,6 +23,11 @@ import serve
 st.set_page_config(page_title="GlowMatch", page_icon="✨", layout="wide")
 
 TOP_N = 10
+# Most options rendered in the product picker at once. The catalog is 8,494
+# products; putting all of them in a single selectbox makes the browser
+# sluggish and is useless to scroll, so search narrows first and this caps
+# what's displayed. The true match count is always shown alongside.
+PRODUCT_PICKER_LIMIT = 200
 SIGNAL_LABELS = {"cf": "Collaborative", "content": "Content", "profile": "Skin profile"}
 # skin_tone carries a literal "notSureST" value for reviewers who declined to
 # specify. It's real data and stays in the affinity tables, but offering it as
@@ -84,6 +89,31 @@ def sample_reviewers(n: int = 300) -> pd.DataFrame:
         .reset_index()
     )
     return top.merge(attrs, on="author_id", how="left")
+
+
+def filter_products(opts: pd.DataFrame, query: str, category: str) -> pd.DataFrame:
+    """Filter the product picker by free-text query and category.
+
+    Every whitespace-separated term must match somewhere in the product name
+    or brand (AND, not OR) — "cerave cleanser" should mean both words, which
+    is what someone typing two words expects, whereas OR would flood the
+    results with every cleanser in the catalog. Matching is case-insensitive
+    substring rather than exact-token so partial words work while typing
+    ("niacin" finds niacinamide products), and regex metacharacters in the
+    query are treated literally so a stray "(" can't raise.
+    """
+    result = opts
+    if category and category != "All categories":
+        result = result[result["primary_category"] == category]
+
+    terms = query.lower().split()
+    if terms:
+        haystack = (result["product_name"] + " " + result["brand_name"]).str.lower()
+        for term in terms:
+            result = result[haystack.str.contains(term, regex=False, na=False)]
+            haystack = haystack.loc[result.index]
+
+    return result
 
 
 def attribute_values(column: str) -> list[str]:
@@ -170,12 +200,56 @@ def mode_by_item() -> None:
     )
 
     opts = product_options()
+
+    search_col, cat_col = st.columns([2, 1])
+    with search_col:
+        query = st.text_input(
+            "Search by product or brand",
+            placeholder="e.g. niacinamide, CeraVe, sunscreen",
+            key="item_search",
+        )
+    with cat_col:
+        categories = ["All categories"] + sorted(opts["primary_category"].dropna().unique())
+        category = st.selectbox("Category", options=categories, key="item_category")
+
+    filtered = filter_products(opts, query, category)
+
+    if filtered.empty:
+        st.info(
+            f"No products match {query!r}"
+            + (f" in {category}." if category != "All categories" else ".")
+            + " Try a shorter or different term."
+        )
+        return
+
+    # Cap the dropdown: rendering thousands of options is slow in the browser
+    # and unhelpful to scroll. The cap applies to what's *displayed*, and the
+    # count below always reports the true number of matches so a truncated
+    # list never silently looks like the complete one.
+    shown = filtered.head(PRODUCT_PICKER_LIMIT)
+    if len(filtered) > len(shown):
+        st.caption(
+            f"{len(filtered):,} matches — showing the {len(shown)} most-reviewed. "
+            "Refine your search to narrow it down."
+        )
+    else:
+        st.caption(f"{len(filtered):,} match{'es' if len(filtered) != 1 else ''}.")
+
     choice = st.selectbox(
         "Pick a product",
-        options=opts.index,
-        format_func=lambda i: f"{opts.loc[i, 'display']}  ({opts.loc[i, 'n_reviews']} reviews)",
+        options=shown.index,
+        format_func=lambda i: f"{shown.loc[i, 'display']}  ({shown.loc[i, 'n_reviews']} reviews)",
+        key="item_pick",
     )
-    product_id = opts.loc[choice, "product_id"]
+    product_id = shown.loc[choice, "product_id"]
+
+    if shown.loc[choice, "n_reviews"] == 0:
+        st.info(
+            "This product has no reviews, so collaborative filtering has nothing to work "
+            "from — recommendations will come from content similarity alone and be labeled "
+            "as such.",
+            icon="ℹ️",
+        )
 
     if st.button("Get recommendations", type="primary", key="item_go"):
         with st.spinner("Ranking..."):
