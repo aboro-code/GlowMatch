@@ -19,9 +19,30 @@ from __future__ import annotations
 
 import pandas as pd
 
-W_CF = 0.5
+# Tuned 2026-08-26 via eval/tune_weights.py: a 66-point simplex grid search
+# optimizing NDCG@10, then re-verified across 3 independent eval-cohort
+# samples (eval/tuning_verification.csv).
+#
+# Read the tuning result honestly: these weights are NOT meaningfully better
+# than the original hand-picked 0.5/0.3/0.2. The grid's best point improved
+# NDCG@10 by only +0.7%, and the multi-seed check showed why that number
+# means nothing on its own -- variation between evaluation samples (0.00262)
+# is roughly 8x the variation between weight combinations (0.00032), and the
+# combination that topped the seed-42 sweep (0.4/0.5/0.1) placed 3rd and 2nd
+# on the other two seeds. Anything in the interior of the simplex performs
+# about the same; 21 of 66 grid points landed within 5% of the best.
+#
+# What the sweep DOES show clearly is that the corners are bad: single-signal
+# weightings score far worse (CF-only NDCG@10 0.0051, content-only 0.0030,
+# profile-only 0.00026, vs ~0.045 for any reasonable blend). The blend
+# mattering is real; its exact proportions are not.
+#
+# 0.4/0.3/0.3 is adopted because it had the best mean NDCG@10 across the
+# three seeds and won 2 of 3 -- a tiebreak on consistency, not evidence of
+# superiority. Do not present this as a tuning win.
+W_CF = 0.4
 W_CONTENT = 0.3
-W_PROFILE = 0.2
+W_PROFILE = 0.3
 
 DEFAULT_WEIGHTS = {"cf": W_CF, "content": W_CONTENT, "profile": W_PROFILE}
 

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -258,13 +259,19 @@ def _normalize_per_user(df: pd.DataFrame, score_col: str) -> pd.Series:
     return norm.where(~tie_mask, 1.0)
 
 
-def _blend_candidates(
+def normalized_signal_frame(
     cf_candidates: pd.DataFrame, content_candidates: pd.DataFrame, profile_candidates: pd.DataFrame
 ) -> pd.DataFrame:
-    """Reuses blend.py's actual W_CF/W_CONTENT/W_PROFILE constants, so this
-    harness and recommend_by_user()/recommend_by_profile() always score
-    "hybrid" the same way -- Phase 4's weight tuning changes blend.py and
-    this function picks the new weights up automatically."""
+    """Outer-join the three signals' candidates and per-user normalize each,
+    WITHOUT applying any weights. Split out from the weighting step because
+    this is the expensive half (a 3-way outer join plus three grouped
+    normalizations over ~2M rows) and is completely independent of the
+    weights -- so tune_weights.py can compute it once and then sweep dozens
+    of weight combinations over the result almost for free.
+
+    Returns [author_id, product_id, cf_norm, content_norm, profile_norm]
+    with NaNs already filled to 0, meaning "this signal contributed nothing
+    for this candidate"."""
     cf_c = cf_candidates.rename(columns={"score": "cf_score"})
     content_c = content_candidates.rename(columns={"score": "content_score"})
     profile_c = profile_candidates.rename(columns={"score": "profile_score"})
@@ -276,12 +283,40 @@ def _blend_candidates(
     merged["content_norm"] = _normalize_per_user(merged, "content_score").fillna(0)
     merged["profile_norm"] = _normalize_per_user(merged, "profile_score").fillna(0)
 
-    merged["score"] = (
-        blend.W_CF * merged["cf_norm"]
-        + blend.W_CONTENT * merged["content_norm"]
-        + blend.W_PROFILE * merged["profile_norm"]
+    return merged[["author_id", "product_id", "cf_norm", "content_norm", "profile_norm"]]
+
+
+def apply_weights(
+    normalized: pd.DataFrame,
+    w_cf: float = None,
+    w_content: float = None,
+    w_profile: float = None,
+) -> pd.DataFrame:
+    """Weighted sum over an already-normalized signal frame. Weights default
+    to blend.py's actual W_CF/W_CONTENT/W_PROFILE constants, so this harness
+    and recommend_by_user()/recommend_by_profile() always score "hybrid" the
+    same way unless a caller (tune_weights.py) is deliberately probing
+    alternatives."""
+    w_cf = blend.W_CF if w_cf is None else w_cf
+    w_content = blend.W_CONTENT if w_content is None else w_content
+    w_profile = blend.W_PROFILE if w_profile is None else w_profile
+
+    out = normalized[["author_id", "product_id"]].copy()
+    out["score"] = (
+        w_cf * normalized["cf_norm"]
+        + w_content * normalized["content_norm"]
+        + w_profile * normalized["profile_norm"]
     )
-    return merged[["author_id", "product_id", "score"]]
+    return out
+
+
+def _blend_candidates(
+    cf_candidates: pd.DataFrame, content_candidates: pd.DataFrame, profile_candidates: pd.DataFrame
+) -> pd.DataFrame:
+    """Convenience wrapper: normalize then apply blend.py's default weights."""
+    return apply_weights(
+        normalized_signal_frame(cf_candidates, content_candidates, profile_candidates)
+    )
 
 
 def compute_metrics(
@@ -326,25 +361,53 @@ def compute_metrics(
     }
 
 
-def run(n_users: int = N_EVAL_USERS, seed: int = RANDOM_SEED) -> pd.DataFrame:
-    t0 = time.time()
-    print("Loading reviews...")
+@dataclass
+class EvalContext:
+    """Everything the leakage-safe evaluation setup produces, so callers that
+    need to evaluate repeatedly (tune_weights.py sweeping weight
+    combinations) can pay the ~40s setup cost once instead of per run. None
+    of these depend on the blend weights."""
+
+    holdout: pd.DataFrame
+    training_reviews: pd.DataFrame
+    sampled_users: np.ndarray
+    already_rated: pd.DataFrame
+    popularity: pd.Series
+    cf_scope_products: np.ndarray
+    cf_candidates: pd.DataFrame
+    content_candidates: pd.DataFrame
+    profile_candidates: pd.DataFrame
+    normalized: pd.DataFrame
+
+
+def prepare_eval_context(
+    n_users: int = N_EVAL_USERS, seed: int = RANDOM_SEED, verbose: bool = True
+) -> EvalContext:
+    """Run the full leakage-safe setup: sample the eval cohort, hold out each
+    user's most recent interaction, rebuild CF similarity and skin-profile
+    affinity from training data only, and generate each signal's candidates."""
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg)
+
+    log("Loading reviews...")
     reviews = data.load_reviews()
 
-    print(f"Selecting {n_users} eval users (>={MIN_RATINGS_FOR_EVAL} ratings, "
-          f"holding out most recent review by submission_time)...")
+    log(f"Selecting {n_users} eval users (>={MIN_RATINGS_FOR_EVAL} ratings, "
+        f"holding out most recent review by submission_time)...")
     holdout, training_reviews, sampled_users = select_holdout(
         reviews, n_users, MIN_RATINGS_FOR_EVAL, seed
     )
-    print(f"  {len(sampled_users)} users, {len(training_reviews)} training reviews "
-          f"({len(reviews) - len(training_reviews)} held out)")
+    log(f"  {len(sampled_users)} users, {len(training_reviews)} training reviews "
+        f"({len(reviews) - len(training_reviews)} held out)")
 
-    print("Rebuilding CF matrix + similarity from training data only (leakage prevention)...")
+    log("Rebuilding CF matrix + similarity from training data only (leakage prevention)...")
     train_uim = matrix.build_from_reviews(training_reviews)
     train_sim = cf.compute_item_similarity(train_uim)
     train_cf_neighbors = cf.top_k_neighbors(train_sim, train_uim.product_ids, k=cf.TOP_K)
 
-    print("Rebuilding skin-profile affinity from training data only...")
+    log("Rebuilding skin-profile affinity from training data only...")
     train_skin_type = skin_profile._shrunk_affinity(
         training_reviews, "skin_type", skin_profile.SHRINKAGE_M
     )
@@ -352,7 +415,7 @@ def run(n_users: int = N_EVAL_USERS, seed: int = RANDOM_SEED) -> pd.DataFrame:
         training_reviews, "skin_tone", skin_profile.SHRINKAGE_M
     )
 
-    print("Loading content neighbors (no rebuild -- attribute-based, no rating leakage)...")
+    log("Loading content neighbors (no rebuild -- attribute-based, no rating leakage)...")
     content_neighbors = content.build_content_neighbors()
 
     cf_scope_products = np.array(sorted(data.reviewed_product_ids()))
@@ -362,6 +425,55 @@ def run(n_users: int = N_EVAL_USERS, seed: int = RANDOM_SEED) -> pd.DataFrame:
     already_rated = eval_training[["author_id", "product_id"]]
     seeds = eval_training[["author_id", "product_id", "rating"]].copy()
     seeds["rating"] = seeds["rating"].astype(float)
+
+    log("Generating signal candidates...")
+    cf_candidates = _aggregate_neighbors_vectorized(seeds, train_cf_neighbors)
+    content_candidates = _aggregate_neighbors_vectorized(seeds, content_neighbors)
+    user_attrs = _infer_user_attrs(training_reviews, sampled_users)
+    profile_candidates = _profile_candidates(user_attrs, train_skin_type, train_skin_tone)
+    normalized = normalized_signal_frame(cf_candidates, content_candidates, profile_candidates)
+
+    return EvalContext(
+        holdout=holdout,
+        training_reviews=training_reviews,
+        sampled_users=sampled_users,
+        already_rated=already_rated,
+        popularity=popularity,
+        cf_scope_products=cf_scope_products,
+        cf_candidates=cf_candidates,
+        content_candidates=content_candidates,
+        profile_candidates=profile_candidates,
+        normalized=normalized,
+    )
+
+
+def evaluate_weights(
+    ctx: EvalContext,
+    w_cf: float = None,
+    w_content: float = None,
+    w_profile: float = None,
+    system_name: str = "hybrid",
+) -> dict:
+    """Score the hybrid system under a specific weight combination, reusing
+    ctx's already-computed candidates. Cheap enough to call in a grid-search
+    loop."""
+    blended = apply_weights(ctx.normalized, w_cf, w_content, w_profile)
+    top = _rank_and_truncate(blended, ctx.already_rated, "score", TOP_N)
+    return compute_metrics(
+        system_name, top, ctx.holdout, ctx.sampled_users,
+        len(ctx.cf_scope_products), ctx.popularity,
+    )
+
+
+def run(n_users: int = N_EVAL_USERS, seed: int = RANDOM_SEED) -> pd.DataFrame:
+    t0 = time.time()
+    ctx = prepare_eval_context(n_users=n_users, seed=seed)
+
+    holdout = ctx.holdout
+    sampled_users = ctx.sampled_users
+    already_rated = ctx.already_rated
+    popularity = ctx.popularity
+    cf_scope_products = ctx.cf_scope_products
 
     results = []
 
@@ -378,21 +490,15 @@ def run(n_users: int = N_EVAL_USERS, seed: int = RANDOM_SEED) -> pd.DataFrame:
     results.append(compute_metrics("popularity", pop_top, holdout, sampled_users, len(cf_scope_products), popularity))
 
     print("Content-only...")
-    content_candidates = _aggregate_neighbors_vectorized(seeds, content_neighbors)
-    content_top = _rank_and_truncate(content_candidates, already_rated, "score", TOP_N)
+    content_top = _rank_and_truncate(ctx.content_candidates, already_rated, "score", TOP_N)
     results.append(compute_metrics("content", content_top, holdout, sampled_users, len(cf_scope_products), popularity))
 
     print("CF-only...")
-    cf_candidates = _aggregate_neighbors_vectorized(seeds, train_cf_neighbors)
-    cf_top = _rank_and_truncate(cf_candidates, already_rated, "score", TOP_N)
+    cf_top = _rank_and_truncate(ctx.cf_candidates, already_rated, "score", TOP_N)
     results.append(compute_metrics("cf", cf_top, holdout, sampled_users, len(cf_scope_products), popularity))
 
     print("Hybrid...")
-    user_attrs = _infer_user_attrs(training_reviews, sampled_users)
-    profile_candidates = _profile_candidates(user_attrs, train_skin_type, train_skin_tone)
-    hybrid_candidates = _blend_candidates(cf_candidates, content_candidates, profile_candidates)
-    hybrid_top = _rank_and_truncate(hybrid_candidates, already_rated, "score", TOP_N)
-    results.append(compute_metrics("hybrid", hybrid_top, holdout, sampled_users, len(cf_scope_products), popularity))
+    results.append(evaluate_weights(ctx, system_name="hybrid"))
 
     results_df = pd.DataFrame(results)
     print(f"\nDone in {time.time() - t0:.1f}s\n")
