@@ -126,13 +126,35 @@ def _aggregate_neighbor_signal(
     products: pd.DataFrame,
     seed_phrase: str,
 ) -> pd.DataFrame:
-    """Aggregate a neighbor table across multiple seed products into one
-    weighted score per candidate, using the classic item-based prediction
-    formula: score(candidate) = sum(similarity * seed_weight) / sum(similarity)
-    over every seed that lists the candidate as a neighbor. seed_weight is
-    either the user's own rating (recommend_by_user) or a skin-profile
-    affinity score (recommend_by_profile) — both live on roughly a 1-5 scale,
-    so the same formula applies to either.
+    """Aggregate a neighbor table across multiple seed products into one score
+    per candidate:
+
+        score(candidate) = sum over the user's seeds j of similarity(candidate, j)
+
+    i.e. how strongly the candidate is connected, in aggregate, to everything
+    the user has already engaged with.
+
+    Why this and NOT the textbook prediction formula sum(sim * r) / sum(sim):
+    that formula predicts *what rating the user would give*, the right
+    objective for RMSE and the wrong one for top-N ranking. Dividing by
+    sum(sim) deliberately cancels out how strongly a candidate connects to
+    the user's history — but for ranking, that connection strength is the
+    entire signal. It matters enormously here: 82% of ratings are 4 or 5
+    stars, so the ratio collapses to roughly 4.5 for nearly every candidate
+    and ranking becomes almost arbitrary. Measured on the leave-one-out
+    harness, CF-only scored HitRate@10 0.0126 with the normalized formula
+    and 0.1992 with this one — a 16x difference caused by the denominator
+    alone. See the methodology note in README.md.
+
+    Seed ratings are deliberately NOT used as weights here, and seeds are
+    NOT filtered to highly-rated items. Both were measured and both were
+    worse: weighting by raw rating 0.1966, centering at 3.0 0.1556,
+    centering at the user's own mean 0.0840, restricting to ratings >= 4
+    0.1566, versus 0.1992 for the plain sum. The adjusted-cosine similarity
+    is already mean-centered per user (see cf.py), so preference direction
+    is encoded in the similarity itself; re-applying rating weights on top
+    double-counts it and adds noise. seed_weights is still accepted and used
+    for the human-readable evidence line, just not for ranking.
 
     Evidence keeps only the single best-contributing seed per candidate
     (highest similarity) rather than trying to summarize every seed that
@@ -144,12 +166,8 @@ def _aggregate_neighbor_signal(
 
     rows = rows.copy()
     rows["seed_weight"] = rows["product_id"].map(seed_weights)
-    rows["weighted"] = rows["similarity"] * rows["seed_weight"]
 
-    grouped = rows.groupby("neighbor_product_id").agg(
-        weighted_sum=("weighted", "sum"), sim_sum=("similarity", "sum")
-    )
-    grouped["score"] = grouped["weighted_sum"] / grouped["sim_sum"]
+    grouped = rows.groupby("neighbor_product_id").agg(score=("similarity", "sum"))
 
     # rows still carries the *seed's* product_id column here — rename it to
     # seed_id before joining, so it can't collide with the candidate id that
@@ -246,8 +264,15 @@ def recommend_by_user(author_id: str, n: int = DEFAULT_N) -> pd.DataFrame:
     rated = dict(zip(user_reviews["product_id"], user_reviews["rating"].astype(float)))
     already_rated = set(rated.keys())
 
-    liked = {pid: r for pid, r in rated.items() if r >= 4}
-    seeds = liked if liked else rated
+    # Every rated product seeds the neighbor lookup, not just highly-rated
+    # ones. Filtering to ratings >= 4 seems obviously right and measures
+    # worse: HitRate@10 0.1566 liked-only versus 0.1992 using all seeds. The
+    # CF similarities are adjusted-cosine (mean-centered per user in cf.py),
+    # so a low-rated product still carries usable information about what this
+    # user's taste neighborhood looks like, and discarding it just shrinks
+    # the evidence base. Keeping eval and production on the same seed rule
+    # matters as much as the rule itself.
+    seeds = rated
 
     products = _products()
 

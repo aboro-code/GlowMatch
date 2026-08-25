@@ -172,16 +172,20 @@ def _aggregate_neighbors_vectorized(
     seeds: pd.DataFrame, neighbor_table: pd.DataFrame
 ) -> pd.DataFrame:
     """seeds: [author_id, product_id, rating]. neighbor_table: [product_id,
-    neighbor_product_id, similarity, rank]. Same weighted item-based
-    prediction formula as recommend.py's _aggregate_neighbor_signal
-    (score = sum(sim*rating)/sum(sim)), but computed for every sampled user
-    at once via merge+groupby instead of one call per user."""
+    neighbor_product_id, similarity, rank].
+
+    Same scoring as recommend.py's _aggregate_neighbor_signal —
+    score = sum of similarities from the user's seeds to the candidate —
+    but computed for every sampled user at once via merge+groupby instead of
+    one call per user. Keeping these two identical is what makes the eval
+    measure the deployed system rather than a lookalike; they previously
+    drifted apart and that is exactly how the rating-prediction scoring bug
+    went unnoticed (see README.md's methodology note).
+    """
     joined = seeds.merge(neighbor_table, on="product_id")
-    joined["weighted"] = joined["similarity"] * joined["rating"]
     grouped = joined.groupby(["author_id", "neighbor_product_id"], observed=True).agg(
-        weighted_sum=("weighted", "sum"), sim_sum=("similarity", "sum")
+        score=("similarity", "sum")
     )
-    grouped["score"] = grouped["weighted_sum"] / grouped["sim_sum"]
     grouped = grouped.reset_index().rename(columns={"neighbor_product_id": "product_id"})
     return grouped[["author_id", "product_id", "score"]]
 

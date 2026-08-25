@@ -19,30 +19,36 @@ from __future__ import annotations
 
 import pandas as pd
 
-# Tuned 2026-08-26 via eval/tune_weights.py: a 66-point simplex grid search
-# optimizing NDCG@10, then re-verified across 3 independent eval-cohort
-# samples (eval/tuning_verification.csv).
+# Retuned 2026-08-26 via eval/tune_weights.py (66-point simplex grid search
+# optimizing NDCG@10) AFTER fixing the CF scoring bug described in
+# recommend.py's _aggregate_neighbor_signal and README.md's methodology note.
+# The previous weights (0.4/0.3/0.3) were fit against a crippled CF signal
+# and are not comparable to these.
 #
-# Read the tuning result honestly: these weights are NOT meaningfully better
-# than the original hand-picked 0.5/0.3/0.2. The grid's best point improved
-# NDCG@10 by only +0.7%, and the multi-seed check showed why that number
-# means nothing on its own -- variation between evaluation samples (0.00262)
-# is roughly 8x the variation between weight combinations (0.00032), and the
-# combination that topped the seed-42 sweep (0.4/0.5/0.1) placed 3rd and 2nd
-# on the other two seeds. Anything in the interior of the simplex performs
-# about the same; 21 of 66 grid points landed within 5% of the best.
+# Collaborative filtering carries this system. With correct top-N scoring,
+# CF-only reaches NDCG@10 0.1844 / HitRate@10 0.1992, and the grid's best
+# blend (these weights) reaches 0.1873 / 0.2022. That accuracy gap is small
+# -- roughly 0.003 in HitRate@10 against a standard error near 0.008 at
+# n=5,000 -- and eval/significance.py tests it directly rather than assuming
+# it. Do not describe the hybrid as more accurate than CF alone unless that
+# test says so.
 #
-# What the sweep DOES show clearly is that the corners are bad: single-signal
-# weightings score far worse (CF-only NDCG@10 0.0051, content-only 0.0030,
-# profile-only 0.00026, vs ~0.045 for any reasonable blend). The blend
-# mattering is real; its exact proportions are not.
+# The blend's defensible benefit is catalog coverage: 0.741 for CF-only
+# versus 0.835 here, a large and unambiguous difference. A recommender that
+# reaches 74% of the catalog and one that reaches 83% differ in a way that
+# matters to a shop, independent of hit rate.
 #
-# 0.4/0.3/0.3 is adopted because it had the best mean NDCG@10 across the
-# three seeds and won 2 of 3 -- a tiebreak on consistency, not evidence of
-# superiority. Do not present this as a tuning win.
-W_CF = 0.4
-W_CONTENT = 0.3
-W_PROFILE = 0.3
+# W_PROFILE stays at 0.1 despite contributing essentially nothing to
+# warm-user ranking (profile-only HitRate@10 0.0004). It earns its place on
+# the cold-start path, where recommend_by_profile has no history to work
+# from and profile affinity is the only personalizing signal available, and
+# in the UI as displayed evidence ("4.6 stars from 210 reviewers with
+# combination skin"). The leave-one-out harness samples users with >=5
+# ratings, so it structurally cannot measure the case this signal exists to
+# serve -- see README.md's limitations section.
+W_CF = 0.8
+W_CONTENT = 0.1
+W_PROFILE = 0.1
 
 DEFAULT_WEIGHTS = {"cf": W_CF, "content": W_CONTENT, "profile": W_PROFILE}
 
