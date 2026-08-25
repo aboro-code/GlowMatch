@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 
 import data
@@ -67,8 +68,14 @@ class UserItemMatrix:
         return self.product_index.get(product_id)
 
 
-def _build(min_user_ratings: int) -> UserItemMatrix:
-    reviews = data.load_reviews()
+def _build(min_user_ratings: int, reviews: pd.DataFrame | None = None) -> UserItemMatrix:
+    """reviews defaults to data.load_reviews() (the normal offline-build
+    path). The eval harness passes a training-only subset here instead —
+    see eval/run_eval.py's leakage-prevention docstring — so this function
+    stays the single place matrix-building logic lives rather than being
+    duplicated for evaluation."""
+    if reviews is None:
+        reviews = data.load_reviews()
 
     counts = reviews.groupby("author_id")["product_id"].nunique()
     eligible_users = counts[counts >= min_user_ratings].index
@@ -97,6 +104,17 @@ def _build(min_user_ratings: int) -> UserItemMatrix:
     )
 
     return UserItemMatrix(matrix, user_ids, product_ids, user_index, product_index)
+
+
+def build_from_reviews(
+    reviews: pd.DataFrame, min_user_ratings: int = MIN_USER_RATINGS
+) -> UserItemMatrix:
+    """Build a UserItemMatrix from an arbitrary reviews DataFrame, uncached —
+    for eval/run_eval.py, which needs a training-only matrix with held-out
+    interactions removed and must never touch the production cache files
+    (data/processed/user_item_matrix.npz) that build_user_item_matrix()
+    reads and writes."""
+    return _build(min_user_ratings, reviews=reviews)
 
 
 def build_user_item_matrix(
