@@ -91,6 +91,98 @@ def sample_reviewers(n: int = 300) -> pd.DataFrame:
     return top.merge(attrs, on="author_id", how="left")
 
 
+# Well-known beauty brands Sephora doesn't carry, mapped to where they are
+# actually sold, so a search that returns nothing can say *why* instead of
+# just "no results". Every entry here was checked against this catalog and
+# confirmed absent — but the check is repeated at runtime in
+# describe_empty_result() rather than trusted, because this list is a
+# convenience and the catalog is the authority. Several brands that feel
+# "drugstore" ARE stocked (Paula's Choice, The Inkey List, Mario Badescu,
+# First Aid Beauty, Glossier, Summer Fridays), and telling a user a product
+# isn't carried when it is would be worse than saying nothing.
+# search term -> (display name, phrase completing "it's sold ...").
+# Display names are stored rather than derived: .title() would render CeraVe
+# as "Cerave" and COSRX as "Cosrx", and getting a brand's own name wrong
+# while explaining the catalog undercuts the message.
+BRANDS_SOLD_ELSEWHERE: dict[str, tuple[str, str]] = {
+    "cerave": ("CeraVe", "at drugstores"),
+    "neutrogena": ("Neutrogena", "at drugstores"),
+    "olay": ("Olay", "at drugstores"),
+    "cetaphil": ("Cetaphil", "at drugstores"),
+    "aveeno": ("Aveeno", "at drugstores"),
+    "nivea": ("Nivea", "at drugstores"),
+    "eucerin": ("Eucerin", "at drugstores"),
+    "la roche-posay": ("La Roche-Posay", "at drugstores and pharmacies"),
+    "la roche posay": ("La Roche-Posay", "at drugstores and pharmacies"),
+    "vaseline": ("Vaseline", "at drugstores"),
+    "dove": ("Dove", "at drugstores"),
+    "garnier": ("Garnier", "at drugstores"),
+    "maybelline": ("Maybelline", "at drugstores"),
+    "revlon": ("Revlon", "at drugstores"),
+    "nyx": ("NYX", "at Ulta and drugstores"),
+    "wet n wild": ("Wet n Wild", "at drugstores"),
+    "st ives": ("St. Ives", "at drugstores"),
+    "pond's": ("Pond's", "at drugstores"),
+    "ponds": ("Pond's", "at drugstores"),
+    "bioderma": ("Bioderma", "at pharmacies"),
+    "avene": ("Avène", "at pharmacies"),
+    "vichy": ("Vichy", "at pharmacies"),
+    "differin": ("Differin", "at drugstores"),
+    "e.l.f.": ("e.l.f.", "at Ulta, Target, and drugstores"),
+    "good molecules": ("Good Molecules", "at Ulta and direct from the brand"),
+    "byoma": ("BYOMA", "at Ulta and Target"),
+    "versed": ("Versed", "at Target and direct from the brand"),
+    "pacifica": ("Pacifica", "at Target and Whole Foods"),
+    "burt's bees": ("Burt's Bees", "at drugstores"),
+    "burts bees": ("Burt's Bees", "at drugstores"),
+    "cosrx": ("COSRX", "on Amazon and at K-beauty retailers"),
+    "some by mi": ("SOME BY MI", "on Amazon and at K-beauty retailers"),
+    "beauty of joseon": ("Beauty of Joseon", "on Amazon and at K-beauty retailers"),
+    "anua": ("Anua", "on Amazon and at K-beauty retailers"),
+    "skin1004": ("SKIN1004", "on Amazon and at K-beauty retailers"),
+    "nuxe": ("NUXE", "at pharmacies and Nordstrom"),
+    "embryolisse": ("Embryolisse", "at pharmacies and Nordstrom"),
+    "rhode": ("Rhode", "direct from the brand only"),
+}
+
+
+def describe_empty_result(opts: pd.DataFrame, query: str, category: str) -> str:
+    """Message for a search that matched nothing.
+
+    When the query names a brand known to be sold elsewhere, say so — "CeraVe
+    is sold at drugstores; this catalog is Sephora's" is a far more useful
+    dead end than "no results", because it tells the user the search worked
+    and the product genuinely isn't here.
+
+    The brand's absence is re-verified against the actual catalog before the
+    message is shown. If a future data refresh adds one of these brands, the
+    claim silently stops firing instead of becoming a confident lie.
+    """
+    q = query.lower().strip()
+    for term, (label, sold_at) in BRANDS_SOLD_ELSEWHERE.items():
+        if term not in q:
+            continue
+        present = (
+            opts["brand_name"].str.lower().str.contains(term, regex=False, na=False).any()
+        )
+        if present:
+            continue  # catalog disagrees with the list -- trust the catalog
+        return (
+            f"**{label}** isn't in this catalog — it's sold {sold_at}. "
+            "This dataset covers Sephora's range only."
+        )
+
+    if category != "All categories":
+        return (
+            f"No products match {query!r} in {category}. "
+            "Try a different term, or widen the category filter."
+        )
+    return (
+        f"No products match {query!r}. This catalog covers Sephora's range "
+        "(304 brands) — try a brand or product type sold there."
+    )
+
+
 def filter_products(opts: pd.DataFrame, query: str, category: str) -> pd.DataFrame:
     """Filter the product picker by free-text query and category.
 
@@ -215,11 +307,7 @@ def mode_by_item() -> None:
     filtered = filter_products(opts, query, category)
 
     if filtered.empty:
-        st.info(
-            f"No products match {query!r}"
-            + (f" in {category}." if category != "All categories" else ".")
-            + " Try a shorter or different term."
-        )
+        st.info(describe_empty_result(opts, query, category))
         return
 
     # Cap the dropdown: rendering thousands of options is slow in the browser
