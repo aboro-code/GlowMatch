@@ -95,6 +95,18 @@ def _dedup_reviews(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
 
     df = df.sort_values("submission_time", kind="stable").reset_index(drop=True)
 
+    # Everything downstream -- matrix.py's user x item construction, the
+    # leave-one-out holdout in eval/run_eval.py -- assumes one row per
+    # (author_id, product_id). Assert it rather than trusting it: when this
+    # silently failed once, the bad rows propagated all the way into the
+    # committed serving artifacts before anything noticed.
+    remaining_dupes = int(df.duplicated(subset=["author_id", "product_id"]).sum())
+    if remaining_dupes:
+        raise AssertionError(
+            f"{remaining_dupes} duplicate (author_id, product_id) pairs survived "
+            "deduplication -- check that dtypes are normalized before this runs."
+        )
+
     stats = {
         "exact_duplicate_rows_dropped": exact_dropped,
         "repeat_pair_rows_dropped": pair_dropped,
@@ -139,9 +151,18 @@ def load_reviews(force_rebuild: bool = False) -> pd.DataFrame:
     if cache_path.exists() and not force_rebuild:
         return pd.read_parquet(cache_path)
 
+    # Cast BEFORE dedup, not after. Deduplication compares raw values, so if
+    # author_id/product_id arrive with inconsistent inferred types, the int
+    # 1011200472 and the string "1011200472" are treated as different keys and
+    # both survive -- then casting to str afterwards silently collapses them
+    # into genuine duplicate (author_id, product_id) pairs in the output. That
+    # actually happened here: an early build (before low_memory=False forced
+    # consistent inference) produced 5 such pairs, which is exactly the
+    # condition matrix.py assumes cannot exist. Normalizing types first makes
+    # the dedup independent of how pandas happened to infer each chunk.
     df = _load_raw_reviews()
-    df, _ = _dedup_reviews(df)
     df = _cast_dtypes(df)
+    df, _ = _dedup_reviews(df)
     _validate_product_join(df, load_products(force_rebuild=force_rebuild))
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
