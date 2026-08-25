@@ -4,8 +4,21 @@ A hybrid beauty product recommendation system built on the Sephora products and 
 
 **Live app:** https://glowmatch-aboro-code.streamlit.app/
 **Repository:** https://github.com/aboro-code/GlowMatch
+**Comparison to production systems:** [COMPARISON.md](COMPARISON.md) — Amazon, YouTube, Spotify, Netflix, and what this system does not do
 
 The deployed app sleeps when idle; a cold first load takes roughly 20 seconds while the container wakes, then responds in well under a second.
+
+### Results at a glance
+
+Leave-one-out over 5,000 users, held-out interactions removed before the collaborative-filtering model was rebuilt.
+
+| | HitRate@10 | Catalog coverage |
+|---|---|---|
+| Popularity baseline | 0.0216 | 1.1% |
+| **Collaborative filtering** | **0.1992** | 74.1% |
+| **Hybrid (deployed)** | **0.2022** | **83.5%** |
+
+Collaborative filtering carries this system — it beats the popularity baseline **9×**. The hybrid adds only +0.003 hit rate on top of that, which is significant in just 2 of 3 samples and is **not** the reason to prefer it; its real contribution is catalog coverage, reaching 83.5% of products against popularity's 1.1%. Full table, significance tests, and an account of a scoring bug that initially inflated these numbers are in [Evaluation methods](#evaluation-methods) and [Design decisions](#design-decisions).
 
 ---
 
@@ -94,7 +107,7 @@ Verified before any code was written (`scripts/verify_dataset.py`):
 | Distinct users | 503,216 |
 | Products with reviews | 2,351 |
 | Full catalog | 8,494 |
-| User×item density | 0.092% |
+| User×item density, all 503,216 users | 0.092% |
 | Users with ≥2 ratings | 209,105 (41.6%) |
 | Users with ≥5 ratings | 40,433 (8.0%) |
 | Products with ≥5 reviews | 2,224 (94.6%) |
@@ -109,7 +122,7 @@ Verified before any code was written (`scripts/verify_dataset.py`):
 | Component | Choice | Why |
 |---|---|---|
 | Data processing | pandas 3.0.2, pyarrow 25.0.1 | Parquet caching keeps re-runs at ~0.6s instead of re-parsing 529 MB |
-| Sparse matrices | scipy 1.18.1 | 209,105 × 2,351 at 0.16% density; dense would be ~2 GB |
+| Sparse matrices | scipy 1.18.1 | 209,105 × 2,351 at 0.16% density (the CF matrix, ≥2-rating users only — denser than the 0.092% over all 503,216 users, since single-review users are excluded); dense would be ~2 GB |
 | Similarity | scikit-learn 1.9.0 | `cosine_similarity(dense_output=False)` stays sparse throughout |
 | Embeddings | sentence-transformers 6.0.0, `all-MiniLM-L6-v2` | 384-dim, fast on CPU, strong on short product text |
 | UI | Streamlit 1.62.0 | Fastest path to a deployed, interactive app |
@@ -149,14 +162,18 @@ Artifacts are committed, so the app runs immediately:
 ```bash
 git clone https://github.com/aboro-code/GlowMatch.git
 cd GlowMatch
-python -m venv .venv && source .venv/Scripts/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate        # macOS / Linux
+# .venv\Scripts\activate         # Windows
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
+On macOS and most Linux distributions the interpreter is `python3`; substitute it for `python` throughout if `python` is not on your path.
+
 ### Rebuild everything from the raw data
 
-Requires Kaggle API credentials at `~/.kaggle/kaggle.json`.
+Requires Kaggle API credentials at `~/.kaggle/kaggle.json` (on Windows, `%USERPROFILE%\.kaggle\kaggle.json`). Create the token from your Kaggle account page under *Settings → API → Create New Token*.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -231,7 +248,7 @@ Verified by assertion rather than assumption (`eval/diagnose_hybrid.py`): held-o
 
 ### Results
 
-5,000 users, blend weights CF 0.8 / content 0.1 / profile 0.1. Every number produced by `python eval/run_eval.py`.
+5,000 users, blend weights CF 0.8 / content 0.1 / profile 0.1, **random seed 42** (`RANDOM_SEED` in `eval/run_eval.py`, which fixes the cohort sample). Every number reproduced by `python eval/run_eval.py` with no arguments.
 
 | System | HitRate@10 | Precision@10 | Recall@10 | NDCG@10 | Coverage | AvgPopularity |
 |---|---|---|---|---|---|---|
@@ -298,17 +315,17 @@ Diagnostics live in `eval/diagnose_hybrid.py` (leakage and pool assertions) and 
 
 **Cold-start for genuinely new products.** A product with no reviews and sparse attribute text gets weak content recommendations and no way to improve until reviews accumulate.
 
-**Skin-tone coverage is uneven.** `skin_tone` has 14 values but is populated on 84.4% of reviews, and the distribution across tones is not uniform. Shrinkage keeps thin evidence from producing overconfident scores, but it cannot manufacture data that was never collected. See COMPARISON.md.
+**Skin-tone coverage is uneven.** `skin_tone` has 14 values but is populated on 84.4% of reviews, and the distribution across tones is not uniform. Shrinkage keeps thin evidence from producing overconfident scores, but it cannot manufacture data that was never collected. Collaborative filtering amplifies a skewed review population rather than correcting it — see [COMPARISON.md § The thing none of them face](COMPARISON.md#the-thing-none-of-them-face).
 
 ## Future improvements
 
 - **Evaluate cold start properly** by holding out entire users, which is the one gap that currently prevents an honest claim about the profile signal.
 - **Implicit signals** — views, add-to-cart, purchases — which are denser and less self-selected than written reviews.
 - **Matrix factorization (ALS/BPR)** as a fourth signal. BPR in particular optimizes a ranking objective directly, which this project's central bug shows is the thing that matters.
-- **Two-stage retrieval and ranking** once the catalog outgrows a single scoring pass. See COMPARISON.md.
+- **Two-stage retrieval and ranking** once the catalog outgrows a single scoring pass — the neighbor tables are already structurally a retrieval layer. Why a single stage is correct at 2,351 items and stops being correct at ~10⁵–10⁶: [COMPARISON.md § YouTube](COMPARISON.md#youtube--two-stage-candidate-generation-and-ranking).
+- **Fairness auditing per skin-tone group**, rather than trusting an aggregate a well-served majority can carry — see [COMPARISON.md](COMPARISON.md#the-thing-none-of-them-face).
 - **A bandit-based exploration slot** to break the popularity feedback loop.
 - **Session awareness** so within-visit behavior affects results.
-- **Fairness auditing by skin tone** — measuring recommendation quality per tone group rather than assuming the aggregate holds.
 
 ## Relationship to BeautyRAG
 
